@@ -45,3 +45,18 @@ kubectl apply -f config/extension.yaml   # set the image first
 
 Pushing a `v*` tag builds and publishes `ghcr.io/<owner>/<repo>:<tag>`
 (`.github/workflows/release.yaml`).
+
+## Test against a real cluster
+
+`internal/inplace/realcluster_test.go` (build tag `realcluster`) runs both
+hooks against a single-node k3s with SUC installed, faking only the
+management cluster. Run on 2026-10-14 against a Debian 13 VM, k3s installed by
+`get.k3s.io` under systemd (as cluster-api-k3s does) with Rancher's
+`system-upgrade-controller` chart 110.0.0: v1.36.5+k3s1 → v1.37.1+k3s1 in
+30 s; the API was unreachable for about 10 s and reported as progress; a
+witness pod kept its container (same ID, no restart); the Plan was deleted.
+
+```sh
+WORKLOAD_KUBECONFIG=... TARGET_VERSION=v1.37.1+k3s1 \
+  go test -tags realcluster -run TestRealCluster -v -timeout 20m ./internal/inplace
+```
