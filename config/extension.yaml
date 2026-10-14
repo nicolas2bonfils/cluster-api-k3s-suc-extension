@@ -1,0 +1,159 @@
+# Runtime Extension updating k3s nodes in place through
+# system-upgrade-controller. Deployed on the management cluster, next to the
+# Cluster API controllers; needs cert-manager for its serving certificate.
+#
+# Requires, on the management cluster:
+#   - core Cluster API with the RuntimeSDK and InPlaceUpdates feature gates;
+#   - the k3s control plane provider with InPlaceUpdates (cluster-api-k3s
+#     with PR #249), and KThreesControlPlane rolloutStrategy maxSurge 0;
+# and system-upgrade-controller in every workload cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: capi-k3s-suc-extension
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: extension
+  namespace: capi-k3s-suc-extension
+---
+# Machines for their node, the <cluster>-kubeconfig Secrets to reach the
+# workload clusters.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: capi-k3s-suc-extension
+rules:
+  - apiGroups: [cluster.x-k8s.io]
+    resources: [machines]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: capi-k3s-suc-extension
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: capi-k3s-suc-extension
+subjects:
+  - kind: ServiceAccount
+    name: extension
+    namespace: capi-k3s-suc-extension
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned
+  namespace: capi-k3s-suc-extension
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: extension
+  namespace: capi-k3s-suc-extension
+spec:
+  dnsNames:
+    - extension.capi-k3s-suc-extension.svc
+    - extension.capi-k3s-suc-extension.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: selfsigned
+  secretName: extension-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: extension
+  namespace: capi-k3s-suc-extension
+spec:
+  ports:
+    - name: https
+      port: 443
+      targetPort: webhook
+  selector:
+    app.kubernetes.io/name: capi-k3s-suc-extension
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: extension
+  namespace: capi-k3s-suc-extension
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: capi-k3s-suc-extension
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: capi-k3s-suc-extension
+    spec:
+      serviceAccountName: extension
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: extension
+          image: ghcr.io/OWNER/cluster-api-k3s-suc-extension:v0.1.0
+          args:
+            - --webhook-cert-dir=/certs
+          ports:
+            - name: webhook
+              containerPort: 9443
+            - name: healthz
+              containerPort: 9440
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: healthz
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tls
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: extension-tls
+            defaultMode: 0440
+---
+# Registers the hooks with Cluster API, which discovers CanUpdateMachine and
+# UpdateMachine. Only one extension may implement them. The CA comes from the
+# serving certificate's Secret.
+apiVersion: runtime.cluster.x-k8s.io/v1beta2
+kind: ExtensionConfig
+metadata:
+  name: k3s-suc
+  annotations:
+    runtime.cluster.x-k8s.io/inject-ca-from-secret: capi-k3s-suc-extension/extension-tls
+spec:
+  clientConfig:
+    service:
+      name: extension
+      namespace: capi-k3s-suc-extension
+      port: 443
