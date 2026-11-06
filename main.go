@@ -109,7 +109,9 @@ func main() {
 		log.Error(err, "Unable to add the health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("webhook", webhookServer.StartedChecker()); err != nil {
+	// GetWebhookServer, not webhookServer: the manager only runs the webhook
+	// server once it has been requested from it.
+	if err := mgr.AddReadyzCheck("webhook", mgr.GetWebhookServer().StartedChecker()); err != nil {
 		log.Error(err, "Unable to add the ready check")
 		os.Exit(1)
 	}
