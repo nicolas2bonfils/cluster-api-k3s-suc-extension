@@ -1,4 +1,4 @@
-module capi-k3s-suc-extension
+module github.com/nicolas2bonfils/cluster-api-k3s-suc-extension
 
 go 1.26.0
 

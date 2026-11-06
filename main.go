@@ -23,7 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"capi-k3s-suc-extension/internal/inplace"
+	"github.com/nicolas2bonfils/cluster-api-k3s-suc-extension/internal/inplace"
 )
 
 const name = "cluster-api-k3s-suc-extension"

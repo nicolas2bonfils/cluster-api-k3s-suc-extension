@@ -35,16 +35,32 @@ keep running while k3s restarts.
   ServiceAccount).
 - cert-manager on the management cluster (serving certificate).
 
-## Build and deploy
+## Install
+
+Each release (`v*` tag) publishes the image `ghcr.io/nicolas2bonfils/cluster-api-k3s-suc-extension:<tag>`
+and, as release assets, `runtime-extension-components.yaml` and `metadata.yaml`. With
+Cluster API Operator, in namespace `capi-k3s-suc-extension` (the components use it):
+
+```yaml
+apiVersion: operator.cluster.x-k8s.io/v1alpha2
+kind: RuntimeExtensionProvider
+metadata:
+  name: k3s-suc
+  namespace: capi-k3s-suc-extension
+spec:
+  version: v0.1.0
+  fetchConfig:
+    url: https://github.com/nicolas2bonfils/cluster-api-k3s-suc-extension/releases/latest/runtime-extension-components.yaml
+```
+
+Or `kubectl apply -f runtime-extension-components.yaml` from a release.
+
+## Build
 
 ```sh
 go test ./...
 podman build -t <registry>/cluster-api-k3s-suc-extension:<tag> .
-kubectl apply -f config/extension.yaml   # set the image first
 ```
-
-Pushing a `v*` tag builds and publishes `ghcr.io/<owner>/<repo>:<tag>`
-(`.github/workflows/release.yaml`).
 
 ## Test against a real cluster
 

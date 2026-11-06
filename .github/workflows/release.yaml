@@ -1,12 +1,17 @@
+# Pushing a v* tag publishes:
+#   - the image ghcr.io/<owner>/<repo>:<tag> (amd64, arm64);
+#   - a GitHub release with runtime-extension-components.yaml (config/
+#     extension.yaml with that image) and metadata.yaml, the files clusterctl
+#     and Cluster API Operator read for a RuntimeExtensionProvider.
 name: release
 on:
   push:
     tags: ["v*"]
 permissions:
-  contents: read
+  contents: write
   packages: write
 jobs:
-  image:
+  release:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -14,6 +19,8 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go vet ./... && go test ./...
+      - name: Image reference
+        run: echo "IMG=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -26,4 +33,16 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          tags: ${{ env.IMG }}
+      - name: Components file
+        run: |
+          sed "s#image: ghcr.io/nicolas2bonfils/cluster-api-k3s-suc-extension:latest#image: ${IMG}#" \
+            config/extension.yaml > runtime-extension-components.yaml
+          grep -q "image: ${IMG}$" runtime-extension-components.yaml
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+            --notes "Image ${IMG}. Install with a RuntimeExtensionProvider (fetchConfig.url .../releases/latest/runtime-extension-components.yaml) or kubectl apply -f runtime-extension-components.yaml." \
+            runtime-extension-components.yaml metadata.yaml
