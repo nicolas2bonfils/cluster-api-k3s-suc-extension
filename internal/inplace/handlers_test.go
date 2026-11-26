@@ -130,6 +130,7 @@ func handlers(mgmt, workload client.Client, workloadErr error) *Handlers {
 		Plan:           settings,
 		RetryAfter:     20 * time.Second,
 		RestartTimeout: 10 * time.Minute,
+		ImmutableKeys:  DefaultImmutableKeys,
 	}
 }
 
@@ -183,6 +184,55 @@ func TestCheckVersionChange(t *testing.T) {
 	}
 }
 
+func TestCheckFilesChange(t *testing.T) {
+	cilium := file(ciliumPath, "flannel-backend: none\n")
+	issuer := file(issuerPath, "kube-apiserver-arg+:\n  - service-account-issuer=https://a\n")
+	toFiles := func(files ...map[string]any) []k3sFile {
+		parsed, _, err := bootstrapFiles(kthreesConfig(files...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return parsed
+	}
+	with := func(f map[string]any, key string, value any) map[string]any {
+		out := map[string]any{}
+		for k, v := range f {
+			out[k] = v
+		}
+		out[key] = value
+		return out
+	}
+	for name, tc := range map[string]struct {
+		current, desired []map[string]any
+		ok               bool
+	}{
+		"unchanged":                 {[]map[string]any{cilium}, []map[string]any{cilium}, true},
+		"drop-in added":             {[]map[string]any{cilium}, []map[string]any{cilium, issuer}, true},
+		"drop-in modified":          {[]map[string]any{cilium, issuer}, []map[string]any{cilium, with(issuer, "content", "kube-apiserver-arg+:\n  - service-account-issuer=https://b\n")}, true},
+		"drop-in removed":           {[]map[string]any{cilium, issuer}, []map[string]any{cilium}, false},
+		"node-ip added":             {nil, []map[string]any{file(ConfigDir+"/node-ip.yaml", "node-ip: 10.0.0.2\n")}, false},
+		"node-ip changed":           {[]map[string]any{file(ConfigDir+"/node-ip.yaml", "node-ip: 10.0.0.2\n")}, []map[string]any{file(ConfigDir+"/node-ip.yaml", "node-ip: 10.0.0.3\n")}, false},
+		"node-ip in any file":       {[]map[string]any{issuer}, []map[string]any{with(issuer, "content", "node-ip: 10.0.0.3\n")}, false},
+		"cluster-cidr appended":     {[]map[string]any{issuer}, []map[string]any{with(issuer, "content", "cluster-cidr+: 10.9.0.0/16\n")}, false},
+		"other key next to node-ip": {[]map[string]any{file(ConfigDir+"/node-ip.yaml", "node-ip: 10.0.0.2\n")}, []map[string]any{file(ConfigDir+"/node-ip.yaml", "node-ip: 10.0.0.2\nnode-external-ip: 1.2.3.4\n")}, true},
+		"not YAML":                  {[]map[string]any{issuer}, []map[string]any{with(issuer, "content", "a: [\n")}, false},
+		"outside config dir":        {nil, []map[string]any{file("/etc/systemd/system/k3s.service.d/10-mounts.conf", "[Unit]\n")}, false},
+		"in a subdirectory":         {nil, []map[string]any{file(ConfigDir+"/sub/x.yaml", "a: b\n")}, false},
+		"encoded":                   {nil, []map[string]any{with(issuer, "encoding", "base64")}, false},
+		"from a Secret":             {nil, []map[string]any{with(issuer, "contentFrom", map[string]any{"secret": map[string]any{"name": "s", "key": "k"}})}, false},
+		"other permissions":         {nil, []map[string]any{with(issuer, "permissions", "0600")}, false},
+		"other owner":               {nil, []map[string]any{with(issuer, "owner", "k3s:k3s")}, false},
+		"unchanged node-ip kept":    {[]map[string]any{file(ConfigDir+"/node-ip.yaml", "node-ip: 10.0.0.2\n")}, []map[string]any{file(ConfigDir+"/node-ip.yaml", "node-ip: 10.0.0.2\n"), issuer}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			reason := checkFilesChange(toFiles(tc.current...), toFiles(tc.desired...), DefaultImmutableKeys)
+			if (reason == "") != tc.ok {
+				t.Errorf("accepted=%v (reason %q), want %v", reason == "", reason, tc.ok)
+			}
+		})
+	}
+}
+
 func TestDesiredHash(t *testing.T) {
 	a := DesiredHash(newVersion, map[string]string{"a.yaml": "1", "b.yaml": "2"})
 	if a != DesiredHash(newVersion, map[string]string{"b.yaml": "2", "a.yaml": "1"}) {
@@ -203,34 +253,64 @@ func TestDesiredHash(t *testing.T) {
 	}
 }
 
-func canUpdate(t *testing.T, h *Handlers, current, desired string) []jsonPatchOperation {
+func canUpdate(t *testing.T, h *Handlers, current, desired string, currentConfig, desiredConfig runtime.RawExtension) (machineOps, bootstrapOps []jsonPatchOperation) {
 	t.Helper()
 	req := &runtimehooksv1.CanUpdateMachineRequest{}
 	req.Current.Machine = *machine(current, true)
 	req.Desired.Machine = *machine(desired, true)
+	req.Current.BootstrapConfig = currentConfig
+	req.Desired.BootstrapConfig = desiredConfig
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
 	h.DoCanUpdateMachine(context.Background(), req, resp)
 	if resp.Status != runtimehooksv1.ResponseStatusSuccess {
 		t.Fatalf("status %s: %s", resp.Status, resp.Message)
 	}
-	for _, p := range []runtimehooksv1.Patch{resp.InfrastructureMachinePatch, resp.BootstrapConfigPatch} {
-		if p.PatchType != runtimehooksv1.JSONPatchType || string(p.Patch) != "[]" {
-			t.Errorf("infra and bootstrap patches must be empty, got %s %s", p.PatchType, p.Patch)
-		}
+	if p := resp.InfrastructureMachinePatch; p.PatchType != runtimehooksv1.JSONPatchType || string(p.Patch) != "[]" {
+		t.Errorf("infra patch must be empty, got %s %s", p.PatchType, p.Patch)
 	}
-	var ops []jsonPatchOperation
-	if err := json.Unmarshal(resp.MachinePatch.Patch, &ops); err != nil {
+	if err := json.Unmarshal(resp.MachinePatch.Patch, &machineOps); err != nil {
 		t.Fatal(err)
 	}
-	return ops
+	if err := json.Unmarshal(resp.BootstrapConfigPatch.Patch, &bootstrapOps); err != nil {
+		t.Fatal(err)
+	}
+	return machineOps, bootstrapOps
 }
 
 func TestCanUpdateMachineClaimsVersion(t *testing.T) {
 	wc := workloadBuilder(true).Build()
 	h := handlers(fake.NewClientBuilder().WithScheme(managementScheme()).Build(), wc, nil)
-	ops := canUpdate(t, h, oldVersion, newVersion)
-	if len(ops) != 1 || ops[0].Op != "replace" || ops[0].Path != "/spec/version" || ops[0].Value != newVersion {
-		t.Errorf("got %+v", ops)
+	cfg := kthreesConfig(file(ciliumPath, "a: b\n"))
+	machineOps, bootstrapOps := canUpdate(t, h, oldVersion, newVersion, cfg, cfg)
+	if len(machineOps) != 1 || machineOps[0].Op != "replace" || machineOps[0].Path != "/spec/version" || machineOps[0].Value != newVersion {
+		t.Errorf("got %+v", machineOps)
+	}
+	if len(bootstrapOps) != 0 {
+		t.Errorf("unchanged files must not be claimed, got %+v", bootstrapOps)
+	}
+}
+
+func TestCanUpdateMachineClaimsFiles(t *testing.T) {
+	wc := workloadBuilder(true).Build()
+	h := handlers(fake.NewClientBuilder().WithScheme(managementScheme()).Build(), wc, nil)
+	current := kthreesConfig(file(ciliumPath, "a: b\n"))
+	desired := kthreesConfig(file(ciliumPath, "a: b\n"), file(issuerPath, "x: y\n"))
+
+	machineOps, bootstrapOps := canUpdate(t, h, newVersion, newVersion, current, desired)
+	if len(machineOps) != 0 {
+		t.Errorf("same version: no machine patch, got %+v", machineOps)
+	}
+	if len(bootstrapOps) != 1 || bootstrapOps[0].Op != "add" || bootstrapOps[0].Path != "/spec/files" {
+		t.Fatalf("got %+v", bootstrapOps)
+	}
+	if files, ok := bootstrapOps[0].Value.([]any); !ok || len(files) != 2 {
+		t.Errorf("the patch must set the desired list, got %+v", bootstrapOps[0].Value)
+	}
+
+	// Together with a version change: both claimed.
+	machineOps, bootstrapOps = canUpdate(t, h, oldVersion, newVersion, current, desired)
+	if len(machineOps) != 1 || len(bootstrapOps) != 1 {
+		t.Errorf("version and files must both be claimed, got %+v %+v", machineOps, bootstrapOps)
 	}
 }
 
@@ -238,19 +318,24 @@ func TestCanUpdateMachineClaimsNothing(t *testing.T) {
 	mgmt := fake.NewClientBuilder().WithScheme(managementScheme()).Build()
 	withSUC := workloadBuilder(true).Build()
 	withoutSUC := workloadBuilder(false).Build()
+	cilium := kthreesConfig(file(ciliumPath, "a: b\n"))
+	withIssuer := kthreesConfig(file(ciliumPath, "a: b\n"), file(issuerPath, "x: y\n"))
 	for name, tc := range map[string]struct {
-		h                *Handlers
-		current, desired string
+		h                    *Handlers
+		current, desired     string
+		currentCfg, desiredC runtime.RawExtension
 	}{
-		"same version":        {handlers(mgmt, withSUC, nil), oldVersion, oldVersion},
-		"downgrade":           {handlers(mgmt, withSUC, nil), newVersion, oldVersion},
-		"two minors":          {handlers(mgmt, withSUC, nil), "v1.35.9+k3s1", newVersion},
-		"SUC not installed":   {handlers(mgmt, withoutSUC, nil), oldVersion, newVersion},
-		"cluster unreachable": {handlers(mgmt, nil, errors.New("connection refused")), oldVersion, newVersion},
+		"same version and files": {handlers(mgmt, withSUC, nil), oldVersion, oldVersion, cilium, cilium},
+		"downgrade":              {handlers(mgmt, withSUC, nil), newVersion, oldVersion, cilium, cilium},
+		"two minors":             {handlers(mgmt, withSUC, nil), "v1.35.9+k3s1", newVersion, cilium, cilium},
+		"file removed":           {handlers(mgmt, withSUC, nil), oldVersion, oldVersion, withIssuer, cilium},
+		"SUC not installed":      {handlers(mgmt, withoutSUC, nil), oldVersion, newVersion, cilium, withIssuer},
+		"cluster unreachable":    {handlers(mgmt, nil, errors.New("connection refused")), oldVersion, newVersion, cilium, withIssuer},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if ops := canUpdate(t, tc.h, tc.current, tc.desired); len(ops) != 0 {
-				t.Errorf("must claim nothing, got %+v", ops)
+			machineOps, bootstrapOps := canUpdate(t, tc.h, tc.current, tc.desired, tc.currentCfg, tc.desiredC)
+			if len(machineOps) != 0 || len(bootstrapOps) != 0 {
+				t.Errorf("must claim nothing, got %+v %+v", machineOps, bootstrapOps)
 			}
 		})
 	}

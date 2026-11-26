@@ -1,12 +1,18 @@
 // Package inplace implements the Cluster API in-place update hooks for k3s
 // nodes, executed by system-upgrade-controller (SUC) in the workload cluster.
 //
-// Only Machine.spec.version is claimed in place: KThreesControlPlane keeps
-// the KThreesConfig version of an existing Machine, so a version bump only
-// changes the Machine. Any other change is left unclaimed and Cluster API
-// falls back to its rollout (which blocks on a single-replica control plane
-// with maxSurge 0, the intended behaviour). The update writes the desired
-// KThreesConfig drop-ins under ConfigDir with the new version.
+// Two kinds of change are updated in place, together or apart, in one k3s
+// restart:
+//   - Machine.spec.version (KThreesControlPlane keeps the KThreesConfig
+//     version of an existing Machine, so a version bump only changes the
+//     Machine);
+//   - KThreesConfig spec.files drop-ins directly under ConfigDir, added or
+//     modified (see checkFilesChange): k0smotron writes the files only when
+//     it provisions a machine, so the extension writes them on the host.
+//
+// Any other change is left unclaimed and Cluster API falls back to its
+// rollout (which blocks on a single-replica control plane with maxSurge 0,
+// the intended behaviour).
 //
 // UpdateMachine is stateless: the progress lives in the SUC Plan, its
 // Secret and the Node, so the extension may restart at any time, including
@@ -17,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -50,6 +57,9 @@ type Handlers struct {
 	// RestartTimeout is how long k3s may take to come back Ready after the
 	// Plan's job completed before UpdateMachine reports a failure.
 	RestartTimeout time.Duration
+	// ImmutableKeys are the k3s configuration keys a drop-in change must not
+	// touch (DefaultImmutableKeys).
+	ImmutableKeys []string
 }
 
 // planHashAnnotation records on the Plan the DesiredHash it applies: the
@@ -64,24 +74,49 @@ type jsonPatchOperation struct {
 }
 
 // DoCanUpdateMachine claims Machine.spec.version when the version change is
-// one k3s supports in place (same major, same or next minor, no downgrade)
-// and SUC runs in the workload cluster. Otherwise it claims nothing.
+// one k3s supports in place (same major, same or next minor, no downgrade),
+// and the KThreesConfig spec.files when checkFilesChange accepts the change,
+// provided SUC runs in the workload cluster. Otherwise it claims nothing.
 func (h *Handlers) DoCanUpdateMachine(ctx context.Context, req *runtimehooksv1.CanUpdateMachineRequest, resp *runtimehooksv1.CanUpdateMachineResponse) {
 	log := ctrl.LoggerFrom(ctx).WithValues("Machine", client.ObjectKeyFromObject(&req.Current.Machine))
 
-	var ops []jsonPatchOperation
+	var machineOps, bootstrapOps []jsonPatchOperation
 	current, desired := req.Current.Machine.Spec.Version, req.Desired.Machine.Spec.Version
 	if current != desired {
-		reason := h.versionChangeRefusal(ctx, &req.Desired.Machine, current, desired)
-		if reason == "" {
-			ops = append(ops, jsonPatchOperation{Op: "replace", Path: "/spec/version", Value: desired})
+		if reason := checkVersionChange(current, desired); reason == "" {
+			machineOps = append(machineOps, jsonPatchOperation{Op: "replace", Path: "/spec/version", Value: desired})
 		} else {
 			log.Info("Version change not handled in place", "current", current, "desired", desired, "reason", reason)
 		}
 	}
 
-	var err error
-	if resp.MachinePatch, err = jsonPatch(ops); err != nil {
+	currentFiles, currentRaw, err := bootstrapFiles(req.Current.BootstrapConfig)
+	if err != nil {
+		fail(&resp.CommonResponse, fmt.Errorf("current bootstrap config: %w", err))
+		return
+	}
+	desiredFiles, desiredRaw, err := bootstrapFiles(req.Desired.BootstrapConfig)
+	if err != nil {
+		fail(&resp.CommonResponse, fmt.Errorf("desired bootstrap config: %w", err))
+		return
+	}
+	if !reflect.DeepEqual(currentRaw, desiredRaw) {
+		if reason := checkFilesChange(currentFiles, desiredFiles, h.ImmutableKeys); reason == "" {
+			// add replaces the list when it exists (RFC 6902).
+			bootstrapOps = append(bootstrapOps, jsonPatchOperation{Op: "add", Path: "/spec/files", Value: desiredRaw})
+		} else {
+			log.Info("Files change not handled in place", "reason", reason)
+		}
+	}
+
+	if len(machineOps)+len(bootstrapOps) > 0 {
+		if reason := h.sucRefusal(ctx, &req.Desired.Machine); reason != "" {
+			log.Info("Change not handled in place", "reason", reason)
+			machineOps, bootstrapOps = nil, nil
+		}
+	}
+
+	if resp.MachinePatch, err = jsonPatch(machineOps); err != nil {
 		fail(&resp.CommonResponse, err)
 		return
 	}
@@ -89,19 +124,16 @@ func (h *Handlers) DoCanUpdateMachine(ctx context.Context, req *runtimehooksv1.C
 		fail(&resp.CommonResponse, err)
 		return
 	}
-	if resp.BootstrapConfigPatch, err = jsonPatch(nil); err != nil {
+	if resp.BootstrapConfigPatch, err = jsonPatch(bootstrapOps); err != nil {
 		fail(&resp.CommonResponse, err)
 		return
 	}
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 }
 
-// versionChangeRefusal returns why a version change cannot be done in
-// place, or "" when it can.
-func (h *Handlers) versionChangeRefusal(ctx context.Context, machine *clusterv1.Machine, current, desired string) string {
-	if reason := checkVersionChange(current, desired); reason != "" {
-		return reason
-	}
+// sucRefusal returns why the workload cluster cannot run the update (SUC
+// missing or the cluster unreachable), or "" when it can.
+func (h *Handlers) sucRefusal(ctx context.Context, machine *clusterv1.Machine) string {
 	wc, err := h.Workload(ctx, clusterKey(machine))
 	if err != nil {
 		return fmt.Sprintf("workload cluster unreachable: %v", err)

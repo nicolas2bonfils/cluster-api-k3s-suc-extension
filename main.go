@@ -8,6 +8,7 @@ import (
 	"flag"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +44,7 @@ func main() {
 	flag.StringVar(&plan.UpgradeImage, "upgrade-image", "rancher/k3s-upgrade", "Image replacing the k3s binary; SUC appends the version as tag")
 	flag.StringVar(&plan.ConfigImage, "config-image", "docker.io/library/busybox:1.37.0", "Image writing the k3s drop-ins on the host (POSIX shell, cp, chroot), with its tag")
 	flag.DurationVar(&retryAfter, "retry-after", 15*time.Second, "Delay before Cluster API polls an ongoing upgrade again")
+	immutableKeys := flag.String("immutable-config-keys", strings.Join(inplace.DefaultImmutableKeys, ","), "k3s configuration keys a drop-in change must not touch (comma-separated)")
 	flag.DurationVar(&restartTimeout, "restart-timeout", 10*time.Minute, "How long k3s may take to be Ready again once the update is applied before it is reported as failed")
 	logOptions := zap.Options{}
 	logOptions.BindFlags(flag.CommandLine)
@@ -97,6 +99,7 @@ func main() {
 		Plan:           plan,
 		RetryAfter:     retryAfter,
 		RestartTimeout: restartTimeout,
+		ImmutableKeys:  splitKeys(*immutableKeys),
 	}
 
 	for _, h := range []server.ExtensionHandler{
@@ -125,4 +128,14 @@ func main() {
 		log.Error(err, "Manager stopped")
 		os.Exit(1)
 	}
+}
+
+func splitKeys(list string) []string {
+	var keys []string
+	for _, k := range strings.Split(list, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }

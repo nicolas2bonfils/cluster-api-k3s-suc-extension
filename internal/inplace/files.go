@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"reflect"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -14,6 +16,13 @@ const (
 	// the only files the extension writes.
 	ConfigDir = "/etc/rancher/k3s/config.yaml.d"
 )
+
+// DefaultImmutableKeys are k3s configuration keys a running server cannot
+// take a new value for: a restart with another node-ip leaves its etcd member
+// on the old peer URL (a cluster reset is needed), and the cluster and
+// service CIDRs, the datastore mode and the data directory are fixed at
+// creation. A drop-in change touching one of them (also as key+) is refused.
+var DefaultImmutableKeys = []string{"node-ip", "cluster-cidr", "service-cidr", "cluster-init", "data-dir"}
 
 // k3sFile is a KThreesConfig spec.files entry.
 type k3sFile struct {
@@ -57,6 +66,67 @@ func bootstrapFiles(obj runtime.RawExtension) ([]k3sFile, []any, error) {
 	return config.Spec.Files, generic.Spec.Files, nil
 }
 
+// checkFilesChange returns why the change from current to desired files
+// cannot be applied in place, or "" when it can (or when nothing changed).
+// Accepted: files added or modified directly under ConfigDir, as plain
+// content, mode 0644, owned by root, whose YAML changes none of
+// immutableKeys. Refused: any other change, including a removal
+// (UpdateMachine only gets the desired state, so it could not tell which
+// file to delete).
+func checkFilesChange(current, desired []k3sFile, immutableKeys []string) string {
+	currentByPath := filesByPath(current)
+	desiredByPath := filesByPath(desired)
+	for p := range currentByPath {
+		if _, kept := desiredByPath[p]; !kept {
+			return fmt.Sprintf("file %s removed", p)
+		}
+	}
+	for p, file := range desiredByPath {
+		if old, found := currentByPath[p]; found && reflect.DeepEqual(old, file) {
+			continue
+		}
+		if reason := checkManagedFile(file); reason != "" {
+			return reason
+		}
+		if reason := immutableKeyChange(currentByPath[p].Content, file.Content, immutableKeys); reason != "" {
+			return fmt.Sprintf("file %s: %s", file.Path, reason)
+		}
+	}
+	return ""
+}
+
+// immutableKeyChange returns which of keys (or key+) old and new k3s
+// configuration YAML set differently, or "" when none.
+func immutableKeyChange(oldContent, newContent string, keys []string) string {
+	oldValues, err := configValues(oldContent)
+	if err != nil {
+		return err.Error()
+	}
+	newValues, err := configValues(newContent)
+	if err != nil {
+		return err.Error()
+	}
+	for _, key := range keys {
+		for _, k := range []string{key, key + "+"} {
+			if !reflect.DeepEqual(oldValues[k], newValues[k]) {
+				return fmt.Sprintf("%s cannot change on an existing server", k)
+			}
+		}
+	}
+	return ""
+}
+
+func configValues(content string) (map[string]any, error) {
+	values := map[string]any{}
+	if strings.TrimSpace(content) == "" {
+		return values, nil
+	}
+	if err := yaml.Unmarshal([]byte(content), &values); err != nil {
+		return nil, fmt.Errorf("not a k3s configuration (YAML map): %w", err)
+	}
+	return values, nil
+}
+
 func checkManagedFile(file k3sFile) string {
 	switch {
 	case path.Dir(file.Path) != ConfigDir:
@@ -71,6 +141,14 @@ func checkManagedFile(file k3sFile) string {
 		return fmt.Sprintf("file %s: permissions %q are not supported", file.Path, file.Permissions)
 	}
 	return ""
+}
+
+func filesByPath(files []k3sFile) map[string]k3sFile {
+	byPath := make(map[string]k3sFile, len(files))
+	for _, f := range files {
+		byPath[path.Clean(f.Path)] = f
+	}
+	return byPath
 }
 
 // configFiles returns the desired ConfigDir drop-ins by file name: the
