@@ -5,10 +5,11 @@
 // the KThreesConfig version of an existing Machine, so a version bump only
 // changes the Machine. Any other change is left unclaimed and Cluster API
 // falls back to its rollout (which blocks on a single-replica control plane
-// with maxSurge 0, the intended behaviour).
+// with maxSurge 0, the intended behaviour). The update writes the desired
+// KThreesConfig drop-ins under ConfigDir with the new version.
 //
-// UpdateMachine is stateless: the progress lives in the SUC Plan and the
-// Node, so the extension may restart at any time, including
+// UpdateMachine is stateless: the progress lives in the SUC Plan, its
+// Secret and the Node, so the extension may restart at any time, including
 // while k3s restarts on the cluster that runs it.
 package inplace
 
@@ -140,9 +141,10 @@ func checkVersionChange(current, desired string) string {
 	return ""
 }
 
-// DoUpdateMachine upgrades k3s on the Machine's node through a SUC Plan,
-// and reports success once SUC labelled the node with the desired state's
-// hash and the node runs the version and is Ready.
+// DoUpdateMachine brings the Machine's node to the desired k3s version and
+// ConfigDir drop-ins through a SUC Plan, and reports success once SUC
+// labelled the node with the desired state's hash and the node runs the
+// version and is Ready.
 func (h *Handlers) DoUpdateMachine(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, resp *runtimehooksv1.UpdateMachineResponse) {
 	log := ctrl.LoggerFrom(ctx).WithValues("Machine", client.ObjectKeyFromObject(&req.Desired.Machine))
 	version := req.Desired.Machine.Spec.Version
@@ -150,7 +152,13 @@ func (h *Handlers) DoUpdateMachine(ctx context.Context, req *runtimehooksv1.Upda
 		fail(&resp.CommonResponse, fmt.Errorf("desired Machine has no version"))
 		return
 	}
-	hash := DesiredHash(version, nil)
+	desiredFiles, _, err := bootstrapFiles(req.Desired.BootstrapConfig)
+	if err != nil {
+		fail(&resp.CommonResponse, fmt.Errorf("desired bootstrap config: %w", err))
+		return
+	}
+	files := configFiles(desiredFiles)
+	hash := DesiredHash(version, files)
 
 	// The request carries the spec only: the node comes from the stored
 	// Machine.
@@ -184,13 +192,18 @@ func (h *Handlers) DoUpdateMachine(ctx context.Context, req *runtimehooksv1.Upda
 			fail(&resp.CommonResponse, fmt.Errorf("delete Plan %s: %w", key, err))
 			return
 		}
-		log.Info("Node upgraded", "node", node.Name, "version", version)
+		if err := wc.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name}}); err != nil && !apierrors.IsNotFound(err) {
+			fail(&resp.CommonResponse, fmt.Errorf("delete Secret %s: %w", key, err))
+			return
+		}
+		log.Info("Node updated", "node", node.Name, "version", version, "files", len(files))
 		resp.Status = runtimehooksv1.ResponseStatusSuccess
-		resp.Message = fmt.Sprintf("node %s runs %s", node.Name, version)
+		resp.Message = fmt.Sprintf("node %s runs %s with %d drop-ins", node.Name, version, len(files))
 		return
 	}
 
-	plan, err := h.ensurePlan(ctx, wc, machine.Name, node, version, hash)
+	versionChange := node.Status.NodeInfo.KubeletVersion != version
+	plan, err := h.ensurePlan(ctx, wc, machine.Name, node, version, hash, versionChange, files)
 	if err != nil {
 		h.wait(resp, fmt.Sprintf("cannot apply Plan %s: %v", key, err))
 		return
@@ -203,18 +216,18 @@ func (h *Handlers) DoUpdateMachine(ctx context.Context, req *runtimehooksv1.Upda
 	created := plan.GetCreationTimestamp()
 	if applied && h.RestartTimeout > 0 && !created.IsZero() && time.Since(created.Time) > h.RestartTimeout {
 		fail(&resp.CommonResponse, fmt.Errorf(
-			"node %s is not Ready at %s %s after the update was applied",
+			"node %s is not Ready at %s %s after the update was applied; the previous drop-ins are under /var/lib/rancher/k3s-suc-backup on the node",
 			node.Name, version, h.RestartTimeout))
 		return
 	}
-	h.wait(resp, fmt.Sprintf("upgrading node %s from %s to %s", node.Name, node.Status.NodeInfo.KubeletVersion, version))
+	h.wait(resp, fmt.Sprintf("updating node %s to %s (%d drop-ins, kubelet %s)", node.Name, version, len(files), node.Status.NodeInfo.KubeletVersion))
 }
 
-// ensurePlan writes the node's Plan for hash. An existing Plan for the same
-// hash is left as it is (it may be restarting k3s); one for another hash is
-// replaced.
-func (h *Handlers) ensurePlan(ctx context.Context, wc client.Client, machineName string, node *corev1.Node, version, hash string) (*unstructured.Unstructured, error) {
-	desired := BuildPlan(h.Plan, machineName, node, version, hash)
+// ensurePlan writes the drop-ins' Secret and the node's Plan for hash. An
+// existing Plan for the same hash is left as it is (it may be restarting
+// k3s); one for another hash is replaced, with its Secret.
+func (h *Handlers) ensurePlan(ctx context.Context, wc client.Client, machineName string, node *corev1.Node, version, hash string, versionChange bool, files map[string]string) (*unstructured.Unstructured, error) {
+	desired := BuildPlan(h.Plan, machineName, node, version, hash, versionChange)
 	desired.SetAnnotations(map[string]string{planHashAnnotation: hash})
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(PlanGVK)
@@ -226,6 +239,9 @@ func (h *Handlers) ensurePlan(ctx context.Context, wc client.Client, machineName
 		return nil, err
 	}
 
+	if err := h.ensureSecret(ctx, wc, BuildFilesSecret(h.Plan, machineName, files)); err != nil {
+		return nil, err
+	}
 	if apierrors.IsNotFound(err) {
 		if err := wc.Create(ctx, desired); err != nil {
 			return nil, err
@@ -238,6 +254,20 @@ func (h *Handlers) ensurePlan(ctx context.Context, wc client.Client, machineName
 		return nil, err
 	}
 	return existing, nil
+}
+
+func (h *Handlers) ensureSecret(ctx context.Context, wc client.Client, desired *corev1.Secret) error {
+	existing := &corev1.Secret{}
+	err := wc.Get(ctx, client.ObjectKeyFromObject(desired), existing)
+	switch {
+	case apierrors.IsNotFound(err):
+		return wc.Create(ctx, desired)
+	case err != nil:
+		return err
+	}
+	existing.Data = desired.Data
+	existing.Labels = desired.Labels
+	return wc.Update(ctx, existing)
 }
 
 func deletePlan(ctx context.Context, wc client.Client, key client.ObjectKey) error {

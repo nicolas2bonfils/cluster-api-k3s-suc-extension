@@ -41,6 +41,7 @@ func main() {
 	flag.StringVar(&plan.Namespace, "suc-namespace", "cattle-system", "Namespace of system-upgrade-controller in the workload clusters")
 	flag.StringVar(&plan.ServiceAccountName, "suc-service-account", "system-upgrade-controller", "ServiceAccount of the upgrade jobs")
 	flag.StringVar(&plan.UpgradeImage, "upgrade-image", "rancher/k3s-upgrade", "Image replacing the k3s binary; SUC appends the version as tag")
+	flag.StringVar(&plan.ConfigImage, "config-image", "docker.io/library/busybox:1.37.0", "Image writing the k3s drop-ins on the host (POSIX shell, cp, chroot), with its tag")
 	flag.DurationVar(&retryAfter, "retry-after", 15*time.Second, "Delay before Cluster API polls an ongoing upgrade again")
 	flag.DurationVar(&restartTimeout, "restart-timeout", 10*time.Minute, "How long k3s may take to be Ready again once the update is applied before it is reported as failed")
 	logOptions := zap.Options{}
@@ -119,7 +120,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("Starting", "sucNamespace", plan.Namespace, "upgradeImage", plan.UpgradeImage)
+	log.Info("Starting", "sucNamespace", plan.Namespace, "upgradeImage", plan.UpgradeImage, "configImage", plan.ConfigImage)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "Manager stopped")
 		os.Exit(1)
