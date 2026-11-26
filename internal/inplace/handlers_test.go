@@ -31,7 +31,11 @@ const (
 	newVersion  = "v1.37.1+k3s1"
 )
 
-var settings = PlanSettings{Namespace: "cattle-system", UpgradeImage: "rancher/k3s-upgrade", ServiceAccountName: "system-upgrade-controller"}
+var settings = PlanSettings{
+	Namespace:          "cattle-system",
+	UpgradeImage:       "rancher/k3s-upgrade",
+	ServiceAccountName: "system-upgrade-controller",
+}
 
 func managementScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
@@ -74,14 +78,18 @@ func machine(version string, withNode bool) *clusterv1.Machine {
 	return m
 }
 
-func node(version string, ready corev1.ConditionStatus) *corev1.Node {
-	return &corev1.Node{
+func node(version string, ready corev1.ConditionStatus, labels ...string) *corev1.Node {
+	n := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: nodeName, Labels: map[string]string{hostnameLabel: nodeName}},
 		Status: corev1.NodeStatus{
 			NodeInfo:   corev1.NodeSystemInfo{KubeletVersion: version},
 			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: ready}},
 		},
 	}
+	for i := 0; i+1 < len(labels); i += 2 {
+		n.Labels[labels[i]] = labels[i+1]
+	}
+	return n
 }
 
 func handlers(mgmt, workload client.Client, workloadErr error) *Handlers {
@@ -140,6 +148,29 @@ func TestCheckVersionChange(t *testing.T) {
 	} {
 		if got := checkVersionChange(tc.current, tc.desired) == ""; got != tc.ok {
 			t.Errorf("%s -> %s: accepted=%v, want %v", tc.current, tc.desired, got, tc.ok)
+		}
+	}
+}
+
+func TestDesiredHash(t *testing.T) {
+	a := DesiredHash(newVersion, map[string]string{"a.yaml": "1", "b.yaml": "2"})
+	if DesiredHash(newVersion, nil) == DesiredHash(oldVersion, nil) {
+		t.Error("the version must change the hash")
+	}
+	if a != DesiredHash(newVersion, map[string]string{"b.yaml": "2", "a.yaml": "1"}) {
+		t.Error("the hash must not depend on map order")
+	}
+	if len(a) != desiredHashLength {
+		t.Errorf("hash length %d, a label value takes at most 63", len(a))
+	}
+	for name, other := range map[string]string{
+		"version": DesiredHash(oldVersion, map[string]string{"a.yaml": "1", "b.yaml": "2"}),
+		"content": DesiredHash(newVersion, map[string]string{"a.yaml": "1", "b.yaml": "3"}),
+		"name":    DesiredHash(newVersion, map[string]string{"a.yaml": "1", "c.yaml": "2"}),
+		"set":     DesiredHash(newVersion, map[string]string{"a.yaml": "1"}),
+	} {
+		if other == a {
+			t.Errorf("a different %s must change the hash", name)
 		}
 	}
 }
@@ -206,6 +237,8 @@ func updateMachine(t *testing.T, h *Handlers) *runtimehooksv1.UpdateMachineRespo
 	return resp
 }
 
+var desiredHash = DesiredHash(newVersion, nil)
+
 func TestUpdateMachineCreatesPlan(t *testing.T) {
 	mgmt := fake.NewClientBuilder().WithScheme(managementScheme()).WithObjects(machine(newVersion, true)).Build()
 	wc := workloadBuilder(true).WithObjects(node(oldVersion, corev1.ConditionTrue)).Build()
@@ -225,6 +258,12 @@ func TestUpdateMachineCreatesPlan(t *testing.T) {
 	if img, _, _ := unstructured.NestedString(plan.Object, "spec", "upgrade", "image"); img != "rancher/k3s-upgrade" {
 		t.Errorf("upgrade image %q", img)
 	}
+	if v, _, _ := unstructured.NestedString(plan.Object, "spec", "postCompleteLabels", AppliedLabel); v != desiredHash {
+		t.Errorf("postCompleteLabels %s = %q, want %q", AppliedLabel, v, desiredHash)
+	}
+	if plan.GetAnnotations()[planHashAnnotation] != desiredHash {
+		t.Errorf("hash annotation %q, want %q", plan.GetAnnotations()[planHashAnnotation], desiredHash)
+	}
 	values, _, _ := unstructured.NestedSlice(plan.Object, "spec", "nodeSelector", "matchExpressions")
 	if len(values) != 1 || values[0].(map[string]any)["values"].([]any)[0] != nodeName {
 		t.Errorf("node selector %+v", values)
@@ -234,11 +273,12 @@ func TestUpdateMachineCreatesPlan(t *testing.T) {
 	}
 }
 
-func TestUpdateMachineUpdatesPlanVersion(t *testing.T) {
+func TestUpdateMachineReplacesPlanForNewHash(t *testing.T) {
 	mgmt := fake.NewClientBuilder().WithScheme(managementScheme()).WithObjects(machine(newVersion, true)).Build()
 	n := node(oldVersion, corev1.ConditionTrue)
-	wc := workloadBuilder(true).
-		WithObjects(n, BuildPlan(settings, machineName, n, "v1.36.6+k3s1")).Build()
+	old := BuildPlan(settings, machineName, n, "v1.36.6+k3s1", "oldhash")
+	old.SetAnnotations(map[string]string{planHashAnnotation: "oldhash"})
+	wc := workloadBuilder(true).WithObjects(n, old).Build()
 
 	if resp := updateMachine(t, handlers(mgmt, wc, nil)); resp.RetryAfterSeconds == 0 {
 		t.Fatalf("want in progress: %s", resp.Message)
@@ -250,12 +290,38 @@ func TestUpdateMachineUpdatesPlanVersion(t *testing.T) {
 	if v, _, _ := unstructured.NestedString(plan.Object, "spec", "version"); v != newVersion {
 		t.Errorf("Plan version %q, want %q", v, newVersion)
 	}
+	if plan.GetAnnotations()[planHashAnnotation] != desiredHash {
+		t.Errorf("the Plan must be replaced for the new state, got hash %q", plan.GetAnnotations()[planHashAnnotation])
+	}
+}
+
+func TestUpdateMachineKeepsPlanForSameHash(t *testing.T) {
+	mgmt := fake.NewClientBuilder().WithScheme(managementScheme()).WithObjects(machine(newVersion, true)).Build()
+	n := node(newVersion, corev1.ConditionTrue)
+	plan := BuildPlan(settings, machineName, n, newVersion, desiredHash)
+	plan.SetAnnotations(map[string]string{planHashAnnotation: desiredHash})
+	plan.SetLabels(map[string]string{"kept": "yes"})
+	wc := workloadBuilder(true).WithObjects(n, plan).Build()
+
+	// k3s already restarted on the new version, SUC has not labelled the
+	// node yet: still in progress, the Plan untouched.
+	if resp := updateMachine(t, handlers(mgmt, wc, nil)); resp.RetryAfterSeconds == 0 {
+		t.Fatalf("not labelled yet: want in progress, got %s", resp.Message)
+	}
+	got, err := getPlan(t, wc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetLabels()["kept"] != "yes" {
+		t.Error("the Plan of the same hash must stay as it is")
+	}
 }
 
 func TestUpdateMachineReportsJobFailure(t *testing.T) {
 	mgmt := fake.NewClientBuilder().WithScheme(managementScheme()).WithObjects(machine(newVersion, true)).Build()
 	n := node(oldVersion, corev1.ConditionTrue)
-	plan := BuildPlan(settings, machineName, n, newVersion)
+	plan := BuildPlan(settings, machineName, n, newVersion, desiredHash)
+	plan.SetAnnotations(map[string]string{planHashAnnotation: desiredHash})
 	_ = unstructured.SetNestedSlice(plan.Object, []any{map[string]any{
 		"type": "Complete", "status": "False", "reason": "JobFailed", "message": "Job failed on Node cortex",
 	}}, "status", "conditions")
@@ -269,9 +335,8 @@ func TestUpdateMachineReportsJobFailure(t *testing.T) {
 
 func TestUpdateMachineDone(t *testing.T) {
 	mgmt := fake.NewClientBuilder().WithScheme(managementScheme()).WithObjects(machine(newVersion, true)).Build()
-	n := node(newVersion, corev1.ConditionTrue)
-	wc := workloadBuilder(true).
-		WithObjects(n, BuildPlan(settings, machineName, n, newVersion)).Build()
+	n := node(newVersion, corev1.ConditionTrue, AppliedLabel, desiredHash)
+	wc := workloadBuilder(true).WithObjects(n, BuildPlan(settings, machineName, n, newVersion, desiredHash)).Build()
 
 	resp := updateMachine(t, handlers(mgmt, wc, nil))
 	if resp.Status != runtimehooksv1.ResponseStatusSuccess || resp.RetryAfterSeconds != 0 {
@@ -280,7 +345,6 @@ func TestUpdateMachineDone(t *testing.T) {
 	if _, err := getPlan(t, wc); !apierrors.IsNotFound(err) {
 		t.Errorf("the Plan must be deleted once done, got %v", err)
 	}
-	// Called again after completion: still done, nothing recreated.
 	if resp := updateMachine(t, handlers(mgmt, wc, nil)); resp.RetryAfterSeconds != 0 {
 		t.Errorf("second call must stay done: %s", resp.Message)
 	}
@@ -289,12 +353,26 @@ func TestUpdateMachineDone(t *testing.T) {
 	}
 }
 
+func TestUpdateMachineNotDoneWithoutLabel(t *testing.T) {
+	// The node runs the version, but SUC did not label it with this state:
+	// the job did not complete (or ran for another state).
+	mgmt := fake.NewClientBuilder().WithScheme(managementScheme()).WithObjects(machine(newVersion, true)).Build()
+	wc := workloadBuilder(true).WithObjects(node(newVersion, corev1.ConditionTrue, AppliedLabel, "other")).Build()
+
+	if resp := updateMachine(t, handlers(mgmt, wc, nil)); resp.RetryAfterSeconds == 0 {
+		t.Fatalf("want in progress, got %s", resp.Message)
+	}
+	if _, err := getPlan(t, wc); err != nil {
+		t.Errorf("a Plan must be created, got %v", err)
+	}
+}
+
 func TestUpdateMachineWaits(t *testing.T) {
 	mgmt := fake.NewClientBuilder().WithScheme(managementScheme()).WithObjects(machine(newVersion, true)).Build()
-	notReady := workloadBuilder(true).WithObjects(node(newVersion, corev1.ConditionFalse)).Build()
+	notReady := workloadBuilder(true).WithObjects(node(newVersion, corev1.ConditionFalse, AppliedLabel, desiredHash)).Build()
 	for name, h := range map[string]*Handlers{
-		"new version but NotReady": handlers(mgmt, notReady, nil),
-		"API down during restart":  handlers(mgmt, nil, errors.New("connection refused")),
+		"applied but NotReady":    handlers(mgmt, notReady, nil),
+		"API down during restart": handlers(mgmt, nil, errors.New("connection refused")),
 	} {
 		t.Run(name, func(t *testing.T) {
 			resp := updateMachine(t, h)

@@ -1,15 +1,15 @@
 // Package inplace implements the Cluster API in-place update hooks for k3s
 // nodes, executed by system-upgrade-controller (SUC) in the workload cluster.
 //
-// Only Machine.spec.version is updated in place: KThreesControlPlane keeps
+// Only Machine.spec.version is claimed in place: KThreesControlPlane keeps
 // the KThreesConfig version of an existing Machine, so a version bump only
 // changes the Machine. Any other change is left unclaimed and Cluster API
 // falls back to its rollout (which blocks on a single-replica control plane
 // with maxSurge 0, the intended behaviour).
 //
-// UpdateMachine is stateless: the progress lives in the SUC Plan and in the
-// Node, so the extension may restart at any time, including while k3s
-// restarts on the cluster that runs it.
+// UpdateMachine is stateless: the progress lives in the SUC Plan and the
+// Node, so the extension may restart at any time, including
+// while k3s restarts on the cluster that runs it.
 package inplace
 
 import (
@@ -47,6 +47,11 @@ type Handlers struct {
 	// again while an upgrade runs.
 	RetryAfter time.Duration
 }
+
+// planHashAnnotation records on the Plan the DesiredHash it applies: the
+// Plan is only rewritten when the desired state changes, never in the
+// middle of its own restart.
+const planHashAnnotation = "cluster-api-k3s-suc-extension/hash"
 
 type jsonPatchOperation struct {
 	Op    string `json:"op"`
@@ -132,8 +137,9 @@ func checkVersionChange(current, desired string) string {
 	return ""
 }
 
-// DoUpdateMachine upgrades k3s on the Machine's node through a SUC Plan and
-// reports success once the node runs the desired version and is Ready.
+// DoUpdateMachine upgrades k3s on the Machine's node through a SUC Plan,
+// and reports success once SUC labelled the node with the desired state's
+// hash and the node runs the version and is Ready.
 func (h *Handlers) DoUpdateMachine(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, resp *runtimehooksv1.UpdateMachineResponse) {
 	log := ctrl.LoggerFrom(ctx).WithValues("Machine", client.ObjectKeyFromObject(&req.Desired.Machine))
 	version := req.Desired.Machine.Spec.Version
@@ -141,6 +147,7 @@ func (h *Handlers) DoUpdateMachine(ctx context.Context, req *runtimehooksv1.Upda
 		fail(&resp.CommonResponse, fmt.Errorf("desired Machine has no version"))
 		return
 	}
+	hash := DesiredHash(version, nil)
 
 	// The request carries the spec only: the node comes from the stored
 	// Machine.
@@ -167,10 +174,11 @@ func (h *Handlers) DoUpdateMachine(ctx context.Context, req *runtimehooksv1.Upda
 		return
 	}
 
-	planKey := client.ObjectKey{Namespace: h.Plan.Namespace, Name: PlanName(machine.Name)}
-	if nodeAtVersion(node, version) {
-		if err := deletePlan(ctx, wc, planKey); err != nil {
-			fail(&resp.CommonResponse, fmt.Errorf("delete Plan %s: %w", planKey, err))
+	key := client.ObjectKey{Namespace: h.Plan.Namespace, Name: PlanName(machine.Name)}
+	applied := node.Labels[AppliedLabel] == hash
+	if applied && nodeAtVersion(node, version) {
+		if err := deletePlan(ctx, wc, key); err != nil {
+			fail(&resp.CommonResponse, fmt.Errorf("delete Plan %s: %w", key, err))
 			return
 		}
 		log.Info("Node upgraded", "node", node.Name, "version", version)
@@ -179,43 +187,45 @@ func (h *Handlers) DoUpdateMachine(ctx context.Context, req *runtimehooksv1.Upda
 		return
 	}
 
-	plan, err := h.ensurePlan(ctx, wc, machine.Name, node, version)
+	plan, err := h.ensurePlan(ctx, wc, machine.Name, node, version, hash)
 	if err != nil {
-		h.wait(resp, fmt.Sprintf("cannot apply Plan %s: %v", planKey, err))
+		h.wait(resp, fmt.Sprintf("cannot apply Plan %s: %v", key, err))
 		return
 	}
 	if message := planFailure(plan); message != "" {
 		// SUC retries the job; Cluster API keeps calling and reports the error.
-		fail(&resp.CommonResponse, fmt.Errorf("upgrade of node %s to %s failed: %s", node.Name, version, message))
+		fail(&resp.CommonResponse, fmt.Errorf("update of node %s failed: %s", node.Name, message))
 		return
 	}
 	h.wait(resp, fmt.Sprintf("upgrading node %s from %s to %s", node.Name, node.Status.NodeInfo.KubeletVersion, version))
 }
 
-// ensurePlan creates the node's Plan, or sets its version when it already
-// exists (the desired version changed during an upgrade).
-func (h *Handlers) ensurePlan(ctx context.Context, wc client.Client, machineName string, node *corev1.Node, version string) (*unstructured.Unstructured, error) {
-	desired := BuildPlan(h.Plan, machineName, node, version)
+// ensurePlan writes the node's Plan for hash. An existing Plan for the same
+// hash is left as it is (it may be restarting k3s); one for another hash is
+// replaced.
+func (h *Handlers) ensurePlan(ctx context.Context, wc client.Client, machineName string, node *corev1.Node, version, hash string) (*unstructured.Unstructured, error) {
+	desired := BuildPlan(h.Plan, machineName, node, version, hash)
+	desired.SetAnnotations(map[string]string{planHashAnnotation: hash})
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(PlanGVK)
 	err := wc.Get(ctx, client.ObjectKeyFromObject(desired), existing)
 	switch {
-	case apierrors.IsNotFound(err):
+	case err == nil && existing.GetAnnotations()[planHashAnnotation] == hash:
+		return existing, nil
+	case err != nil && !apierrors.IsNotFound(err):
+		return nil, err
+	}
+
+	if apierrors.IsNotFound(err) {
 		if err := wc.Create(ctx, desired); err != nil {
 			return nil, err
 		}
 		return desired, nil
-	case err != nil:
-		return nil, err
 	}
-	if v, _, _ := unstructured.NestedString(existing.Object, "spec", "version"); v != version {
-		base := existing.DeepCopy()
-		if err := unstructured.SetNestedField(existing.Object, version, "spec", "version"); err != nil {
-			return nil, err
-		}
-		if err := wc.Patch(ctx, existing, client.MergeFrom(base)); err != nil {
-			return nil, err
-		}
+	existing.Object["spec"] = desired.Object["spec"]
+	existing.SetAnnotations(desired.GetAnnotations())
+	if err := wc.Update(ctx, existing); err != nil {
+		return nil, err
 	}
 	return existing, nil
 }

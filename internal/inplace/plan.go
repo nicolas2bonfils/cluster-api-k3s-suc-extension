@@ -3,6 +3,8 @@ package inplace
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"sort"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -24,6 +26,8 @@ const (
 	// part of a label key is limited to 63 characters.
 	maxPlanNameLength = 63
 	hashLength        = 8
+	// desiredHashLength keeps DesiredHash a valid label value (63 at most).
+	desiredHashLength = 16
 
 	hostnameLabel = "kubernetes.io/hostname"
 )
@@ -57,12 +61,20 @@ type PlanSettings struct {
 	ServiceAccountName string
 }
 
-// BuildPlan returns the Plan that upgrades k3s on one node to version.
+const (
+	// AppliedLabel is set by SUC on the node, from the Plan's
+	// postCompleteLabels, once the Plan's job completed: its value is the
+	// DesiredHash of the state applied. It stays after the Plan is deleted.
+	AppliedLabel = "cluster-api-k3s-suc-extension/applied"
+)
+
+// BuildPlan returns the Plan that upgrades k3s on one node to version. SUC
+// labels the node with AppliedLabel=hash once the job completed.
 //
 // No cordon nor drain: the clusters have a single node, where draining
 // would only stop the workloads that k3s keeps running across its restart.
 // Every taint is tolerated so that the job runs on a control plane node.
-func BuildPlan(s PlanSettings, machineName string, node *corev1.Node, version string) *unstructured.Unstructured {
+func BuildPlan(s PlanSettings, machineName string, node *corev1.Node, version, hash string) *unstructured.Unstructured {
 	hostname := node.Labels[hostnameLabel]
 	if hostname == "" {
 		hostname = node.Name
@@ -94,7 +106,8 @@ func BuildPlan(s PlanSettings, machineName string, node *corev1.Node, version st
 			"upgrade": map[string]any{
 				"image": s.UpgradeImage,
 			},
-			"version": version,
+			"postCompleteLabels": map[string]any{AppliedLabel: hash},
+			"version":            version,
 		},
 	}}
 	plan.SetGroupVersionKind(PlanGVK)
@@ -119,4 +132,21 @@ func planFailure(plan *unstructured.Unstructured) string {
 		}
 	}
 	return ""
+}
+
+// DesiredHash identifies the state a node must reach: k3s version and
+// configuration drop-ins (none yet). SUC labels the node with it once the
+// Plan completed.
+func DesiredHash(version string, files map[string]string) string {
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	h := sha256.New()
+	fmt.Fprintf(h, "version=%s\n", version)
+	for _, name := range names {
+		fmt.Fprintf(h, "file=%s\n%d\n%s\n", name, len(files[name]), files[name])
+	}
+	return hex.EncodeToString(h.Sum(nil))[:desiredHashLength]
 }
