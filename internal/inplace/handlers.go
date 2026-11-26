@@ -46,6 +46,9 @@ type Handlers struct {
 	// RetryAfter is how long Cluster API waits before calling UpdateMachine
 	// again while an upgrade runs.
 	RetryAfter time.Duration
+	// RestartTimeout is how long k3s may take to come back Ready after the
+	// Plan's job completed before UpdateMachine reports a failure.
+	RestartTimeout time.Duration
 }
 
 // planHashAnnotation records on the Plan the DesiredHash it applies: the
@@ -195,6 +198,13 @@ func (h *Handlers) DoUpdateMachine(ctx context.Context, req *runtimehooksv1.Upda
 	if message := planFailure(plan); message != "" {
 		// SUC retries the job; Cluster API keeps calling and reports the error.
 		fail(&resp.CommonResponse, fmt.Errorf("update of node %s failed: %s", node.Name, message))
+		return
+	}
+	created := plan.GetCreationTimestamp()
+	if applied && h.RestartTimeout > 0 && !created.IsZero() && time.Since(created.Time) > h.RestartTimeout {
+		fail(&resp.CommonResponse, fmt.Errorf(
+			"node %s is not Ready at %s %s after the update was applied",
+			node.Name, version, h.RestartTimeout))
 		return
 	}
 	h.wait(resp, fmt.Sprintf("upgrading node %s from %s to %s", node.Name, node.Status.NodeInfo.KubeletVersion, version))

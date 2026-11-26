@@ -104,8 +104,9 @@ func handlers(mgmt, workload client.Client, workloadErr error) *Handlers {
 			}
 			return workload, nil
 		},
-		Plan:       settings,
-		RetryAfter: 20 * time.Second,
+		Plan:           settings,
+		RetryAfter:     20 * time.Second,
+		RestartTimeout: 10 * time.Minute,
 	}
 }
 
@@ -364,6 +365,20 @@ func TestUpdateMachineNotDoneWithoutLabel(t *testing.T) {
 	}
 	if _, err := getPlan(t, wc); err != nil {
 		t.Errorf("a Plan must be created, got %v", err)
+	}
+}
+
+func TestUpdateMachineRestartTimeout(t *testing.T) {
+	mgmt := fake.NewClientBuilder().WithScheme(managementScheme()).WithObjects(machine(newVersion, true)).Build()
+	n := node(newVersion, corev1.ConditionFalse, AppliedLabel, desiredHash)
+	plan := BuildPlan(settings, machineName, n, newVersion, desiredHash)
+	plan.SetAnnotations(map[string]string{planHashAnnotation: desiredHash})
+	plan.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-time.Hour)))
+	wc := workloadBuilder(true).WithObjects(n, plan).Build()
+
+	resp := updateMachine(t, handlers(mgmt, wc, nil))
+	if resp.Status != runtimehooksv1.ResponseStatusFailure || !strings.Contains(resp.Message, "not Ready") {
+		t.Errorf("applied but not Ready for an hour: want a failure, got %s: %s", resp.Status, resp.Message)
 	}
 }
 

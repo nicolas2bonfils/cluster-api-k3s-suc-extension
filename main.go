@@ -30,10 +30,11 @@ const name = "cluster-api-k3s-suc-extension"
 
 func main() {
 	var (
-		certDir    string
-		port       int
-		plan       inplace.PlanSettings
-		retryAfter time.Duration
+		certDir        string
+		port           int
+		plan           inplace.PlanSettings
+		retryAfter     time.Duration
+		restartTimeout time.Duration
 	)
 	flag.StringVar(&certDir, "webhook-cert-dir", "/certs", "Directory of the TLS certificate (tls.crt, tls.key)")
 	flag.IntVar(&port, "webhook-port", 9443, "Port of the Runtime Extension server")
@@ -41,6 +42,7 @@ func main() {
 	flag.StringVar(&plan.ServiceAccountName, "suc-service-account", "system-upgrade-controller", "ServiceAccount of the upgrade jobs")
 	flag.StringVar(&plan.UpgradeImage, "upgrade-image", "rancher/k3s-upgrade", "Image replacing the k3s binary; SUC appends the version as tag")
 	flag.DurationVar(&retryAfter, "retry-after", 15*time.Second, "Delay before Cluster API polls an ongoing upgrade again")
+	flag.DurationVar(&restartTimeout, "restart-timeout", 10*time.Minute, "How long k3s may take to be Ready again once the update is applied before it is reported as failed")
 	logOptions := zap.Options{}
 	logOptions.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -91,8 +93,9 @@ func main() {
 			cfg.Timeout = 10 * time.Second
 			return client.New(cfg, client.Options{Scheme: scheme})
 		},
-		Plan:       plan,
-		RetryAfter: retryAfter,
+		Plan:           plan,
+		RetryAfter:     retryAfter,
+		RestartTimeout: restartTimeout,
 	}
 
 	for _, h := range []server.ExtensionHandler{
