@@ -15,6 +15,17 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+      # clusterctl and Cluster API Operator refuse a version outside the
+      # release series of metadata.yaml: fail before publishing anything.
+      - name: Release series in metadata.yaml
+        run: |
+          v="${GITHUB_REF_NAME#v}"; v="${v%%-*}"
+          major="${v%%.*}"; minor="${v#*.}"; minor="${minor%%.*}"
+          if ! grep -A1 -E "^[[:space:]]*- major: ${major}[[:space:]]*$" metadata.yaml \
+              | grep -qE "^[[:space:]]*minor: ${minor}[[:space:]]*$"; then
+            echo "::error file=metadata.yaml::no release series ${major}.${minor} for ${GITHUB_REF_NAME}"
+            exit 1
+          fi
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
