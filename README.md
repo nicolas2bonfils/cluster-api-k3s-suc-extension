@@ -36,7 +36,8 @@ or Secret-sourced content, other modes or owners, `serverConfig` fields.
   - drop-ins only: one step (`--config-image`, busybox) writes them and
     restarts k3s (`systemctl restart k3s` on the host).
   Before writing, the current drop-ins are copied to
-  `/var/lib/rancher/k3s-suc-backup/<time>/` on the node. SUC labels the node
+  `/var/lib/rancher/k3s-suc-backup/<time>/` on the node, where the 5 latest
+  copies are kept. SUC labels the node
   `cluster-api-k3s-suc-extension/applied=<hash of version and drop-ins>` once
   the job completed; the update is done when the node has that label, runs
   the version and is Ready. The Plan and its Secret are then deleted. A failed

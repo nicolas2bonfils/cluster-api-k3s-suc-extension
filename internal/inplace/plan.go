@@ -75,16 +75,25 @@ const (
 	// filesMountPath is where SUC mounts the Secret of the drop-ins in the job.
 	filesMountPath = "/run/k3s-suc/files"
 
+	// keepBackups is how many copies of the drop-ins stay on the host: the
+	// one taken before this update and the previous ones.
+	keepBackups = "5"
+
 	// writeFilesScript writes the drop-ins from the Secret into the host's
 	// ConfigDir, atomically per file, after a copy of the current ones under
-	// /var/lib/rancher/k3s-suc-backup. With RESTART=true it then restarts
-	// k3s (files only); otherwise k3s-upgrade restarts it next.
+	// /var/lib/rancher/k3s-suc-backup, where only the keepBackups latest
+	// copies are kept. With RESTART=true it then restarts k3s (files only);
+	// otherwise k3s-upgrade restarts it next.
 	writeFilesScript = `set -eu
 src=` + filesMountPath + `
 dst=/host` + ConfigDir + `
-backup=/host/var/lib/rancher/k3s-suc-backup/$(date +%Y%m%dT%H%M%S)
+backups=/host/var/lib/rancher/k3s-suc-backup
+backup=$backups/$(date +%Y%m%dT%H%M%S)
 mkdir -p "$dst" "$backup"
 cp -p "$dst"/* "$backup"/ 2>/dev/null || true
+ls -1 "$backups" | sort -r | tail -n +$((` + keepBackups + ` + 1)) | while read -r old; do
+  rm -rf "${backups:?}/$old"
+done
 for f in "$src"/*; do
   [ -f "$f" ] || continue
   name=$(basename "$f")

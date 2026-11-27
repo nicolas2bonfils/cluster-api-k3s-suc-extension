@@ -606,6 +606,15 @@ func TestWriteFilesScriptRestartsOnlyWhenAsked(t *testing.T) {
 	}
 }
 
+func TestWriteFilesScriptKeepsTheLatestBackups(t *testing.T) {
+	if !strings.Contains(writeFilesScript, "tail -n +$(("+keepBackups+" + 1))") {
+		t.Errorf("the script must keep the %s latest backups", keepBackups)
+	}
+	if !strings.Contains(writeFilesScript, `rm -rf "${backups:?}/$old"`) {
+		t.Error("the pruning must stay under the backup directory")
+	}
+}
+
 func keys(data map[string][]byte) []string {
 	out := make([]string, 0, len(data))
 	for k := range data {
